@@ -4,6 +4,7 @@ import numpy as np
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import uuid
 
 app = FastAPI()
@@ -492,7 +493,8 @@ async def upload_photo(
 
         attendance = load_attendance()
 
-        now = datetime.now()
+        # Always save attendance time in India Standard Time (IST).
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
         date = now.strftime(
             "%Y-%m-%d"
@@ -566,7 +568,6 @@ async def upload_photo(
         save_attendance(attendance)
 
 
-
         print(
             f"✅ Attendance marked: "
             f"{len(newly_marked)} student(s)"
@@ -587,11 +588,11 @@ async def upload_photo(
             "faces_detected":
                 len(faces),
 
-            "recognized_students":  
+            "recognized_students":
                 recognized_students,
 
             "attendance_marked":
-                len(newly_marked),
+                newly_marked,
 
             "session_id":
                 session_id
