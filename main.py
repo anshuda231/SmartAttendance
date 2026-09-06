@@ -7,6 +7,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import uuid
 
+import psycopg
+from psycopg.rows import dict_row
+
 app = FastAPI()
 
 # =====================================================
@@ -20,7 +23,6 @@ DATA_FOLDER = "data"
 os.makedirs(STUDENTS_FOLDER, exist_ok=True)
 os.makedirs(MODELS_FOLDER, exist_ok=True)
 os.makedirs(DATA_FOLDER, exist_ok=True)
-
 
 # =====================================================
 # MODEL PATHS
@@ -36,20 +38,286 @@ SFACE_MODEL = os.path.join(
     "face_recognition_sface_2021dec.onnx"
 )
 
+# =====================================================
+# DATABASE
+# =====================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+STUDENT_DB = os.path.join(DATA_FOLDER, "students.json")
+ATTENDANCE_DB = os.path.join(DATA_FOLDER, "attendance.json")
+
+
+def db_enabled():
+    return bool(DATABASE_URL)
+
+
+def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def init_database():
+    """Create PostgreSQL tables and import old JSON data once."""
+    if not db_enabled():
+        print("⚠️ DATABASE_URL not found. Using local JSON storage.")
+        return
+
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS students (
+                roll_number TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                photo TEXT,
+                embedding JSONB NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id BIGSERIAL PRIMARY KEY,
+                session_id TEXT,
+                name TEXT NOT NULL,
+                roll_number TEXT NOT NULL,
+                date DATE NOT NULL,
+                time TIME NOT NULL,
+                status TEXT NOT NULL,
+                confidence DOUBLE PRECISION
+            )
+        """)
+
+        # Import existing JSON students only if PostgreSQL is empty.
+        student_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM students"
+        ).fetchone()["count"]
+
+        if student_count == 0 and os.path.exists(STUDENT_DB):
+            try:
+                with open(STUDENT_DB, "r", encoding="utf-8") as f:
+                    old_students = json.load(f)
+
+                for roll, student in old_students.items():
+                    conn.execute(
+                        """
+                        INSERT INTO students
+                            (roll_number, name, photo, embedding)
+                        VALUES
+                            (%s, %s, %s, %s::jsonb)
+                        ON CONFLICT (roll_number) DO NOTHING
+                        """,
+                        (
+                            roll,
+                            student.get("name", "Unknown"),
+                            student.get("photo"),
+                            json.dumps(student.get("embedding", []))
+                        )
+                    )
+
+                print(f"✅ Imported {len(old_students)} student(s) from JSON")
+            except Exception as e:
+                print("⚠️ Student JSON migration skipped:", e)
+
+        # Import old JSON attendance only if PostgreSQL is empty.
+        attendance_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM attendance"
+        ).fetchone()["count"]
+
+        if attendance_count == 0 and os.path.exists(ATTENDANCE_DB):
+            try:
+                with open(ATTENDANCE_DB, "r", encoding="utf-8") as f:
+                    old_attendance = json.load(f)
+
+                for record in old_attendance:
+                    record_date = record.get("date")
+                    record_time = record.get("time")
+
+                    if not record_date or not record_time:
+                        continue
+
+                    conn.execute(
+                        """
+                        INSERT INTO attendance
+                            (session_id, name, roll_number, date, time,
+                             status, confidence)
+                        VALUES
+                            (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            record.get("session_id"),
+                            record.get("name", "Unknown"),
+                            record.get("roll_number", ""),
+                            record_date,
+                            record_time,
+                            record.get("status", "Present"),
+                            record.get("confidence")
+                        )
+                    )
+
+                print(
+                    f"✅ Imported {len(old_attendance)} attendance record(s) "
+                    "from JSON"
+                )
+            except Exception as e:
+                print("⚠️ Attendance JSON migration skipped:", e)
+
+        conn.commit()
+        print("✅ PostgreSQL database ready")
+
 
 # =====================================================
-# DATABASE FILES
+# STUDENT DATABASE FUNCTIONS
 # =====================================================
 
-STUDENT_DB = os.path.join(
-    DATA_FOLDER,
-    "students.json"
-)
+def load_students():
+    if db_enabled():
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT roll_number, name, photo, embedding
+                FROM students
+                ORDER BY roll_number
+                """
+            ).fetchall()
 
-ATTENDANCE_DB = os.path.join(
-    DATA_FOLDER,
-    "attendance.json"
-)
+        result = {}
+        for row in rows:
+            embedding = row["embedding"]
+
+            if isinstance(embedding, str):
+                embedding = json.loads(embedding)
+
+            result[row["roll_number"]] = {
+                "name": row["name"],
+                "roll_number": row["roll_number"],
+                "photo": row["photo"],
+                "embedding": embedding
+            }
+
+        return result
+
+    if not os.path.exists(STUDENT_DB):
+        return {}
+
+    try:
+        with open(STUDENT_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return {}
+
+
+def save_student(student):
+    if db_enabled():
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO students
+                    (roll_number, name, photo, embedding)
+                VALUES
+                    (%s, %s, %s, %s::jsonb)
+                ON CONFLICT (roll_number)
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    photo = EXCLUDED.photo,
+                    embedding = EXCLUDED.embedding
+                """,
+                (
+                    student["roll_number"],
+                    student["name"],
+                    student.get("photo"),
+                    json.dumps(student["embedding"])
+                )
+            )
+            conn.commit()
+
+        return
+
+    students = load_students()
+    students[student["roll_number"]] = student
+
+    with open(STUDENT_DB, "w", encoding="utf-8") as file:
+        json.dump(students, file, indent=4)
+
+
+# =====================================================
+# ATTENDANCE DATABASE FUNCTIONS
+# =====================================================
+
+def load_attendance():
+    if db_enabled():
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    session_id,
+                    name,
+                    roll_number,
+                    TO_CHAR(date, 'YYYY-MM-DD') AS date,
+                    TO_CHAR(time, 'HH24:MI:SS') AS time,
+                    status,
+                    confidence
+                FROM attendance
+                ORDER BY date DESC, time DESC, id DESC
+                """
+            ).fetchall()
+
+        result = []
+
+        for row in rows:
+            result.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "name": row["name"],
+                "roll_number": row["roll_number"],
+                "date": row["date"],
+                "time": row["time"],
+                "status": row["status"],
+                "confidence": row["confidence"]
+            })
+
+        return result
+
+    if not os.path.exists(ATTENDANCE_DB):
+        return []
+
+    try:
+        with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return []
+
+
+def save_attendance_record(record):
+    if db_enabled():
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO attendance
+                    (session_id, name, roll_number, date, time,
+                     status, confidence)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    record.get("session_id"),
+                    record["name"],
+                    record["roll_number"],
+                    record["date"],
+                    record["time"],
+                    record["status"],
+                    record.get("confidence")
+                )
+            )
+            conn.commit()
+
+        return
+
+    attendance = load_attendance()
+    attendance.append(record)
+
+    with open(ATTENDANCE_DB, "w", encoding="utf-8") as file:
+        json.dump(attendance, file, indent=4)
 
 
 # =====================================================
@@ -67,7 +335,6 @@ detector = cv2.FaceDetectorYN.create(
 
 print("✅ YuNet face detector loaded")
 
-
 recognizer = cv2.FaceRecognizerSF.create(
     SFACE_MODEL,
     ""
@@ -76,82 +343,12 @@ recognizer = cv2.FaceRecognizerSF.create(
 print("✅ SFace face recognizer loaded")
 
 
-# =====================================================
-# STUDENT DATABASE FUNCTIONS
-# =====================================================
-
-def load_students():
-
-    if not os.path.exists(STUDENT_DB):
-        return {}
-
+@app.on_event("startup")
+def startup_event():
     try:
-
-        with open(
-            STUDENT_DB,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return json.load(file)
-
-    except:
-
-        return {}
-
-
-def save_students(students):
-
-    with open(
-        STUDENT_DB,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            students,
-            file,
-            indent=4
-        )
-
-
-# =====================================================
-# ATTENDANCE DATABASE FUNCTIONS
-# =====================================================
-
-def load_attendance():
-
-    if not os.path.exists(ATTENDANCE_DB):
-        return []
-
-    try:
-
-        with open(
-            ATTENDANCE_DB,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return json.load(file)
-
-    except:
-
-        return []
-
-
-def save_attendance(attendance):
-
-    with open(
-        ATTENDANCE_DB,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            attendance,
-            file,
-            indent=4
-        )
+        init_database()
+    except Exception as e:
+        print("❌ Database startup error:", e)
 
 
 # =====================================================
@@ -160,10 +357,10 @@ def save_attendance(attendance):
 
 @app.get("/")
 def home():
-
     return {
         "success": True,
-        "message": "Smart Attendance Backend is Running"
+        "message": "Smart Attendance Backend is Running",
+        "database": "PostgreSQL" if db_enabled() else "Local JSON"
     }
 
 
@@ -177,9 +374,7 @@ async def register_student(
     roll_number: str = Form(...),
     file: UploadFile = File(...)
 ):
-
     try:
-
         image_bytes = await file.read()
 
         image_array = np.frombuffer(
@@ -193,92 +388,51 @@ async def register_student(
         )
 
         if image is None:
-
             return {
                 "success": False,
                 "message": "Invalid student photo"
             }
 
-
-        # -------------------------------------------------
-        # Detect face
-        # -------------------------------------------------
-
         height, width = image.shape[:2]
 
-        detector.setInputSize(
-            (width, height)
-        )
-
+        detector.setInputSize((width, height))
         _, faces = detector.detect(image)
 
-
         if faces is None or len(faces) == 0:
-
             return {
                 "success": False,
                 "message": "No face detected"
             }
 
-
         if len(faces) > 1:
-
             return {
                 "success": False,
-                "message":
-                    "Please capture photo with only one face"
+                "message": "Please capture photo with only one face"
             }
 
-
-        # -------------------------------------------------
-        # Get face
-        # -------------------------------------------------
-
         face = faces[0]
-
-
-        # -------------------------------------------------
-        # Align face
-        # -------------------------------------------------
 
         aligned_face = recognizer.alignCrop(
             image,
             face
         )
 
-
-        # -------------------------------------------------
-        # Generate embedding
-        # -------------------------------------------------
-
         feature = recognizer.feature(
             aligned_face
         )
 
-
         embedding = feature.flatten().tolist()
-
-
-        # -------------------------------------------------
-        # Clean roll number
-        # -------------------------------------------------
 
         safe_roll = "".join(
             c for c in roll_number
-            if c.isalnum()
+            if c.isalnum() or c in ("-", "_")
         )
 
         if not safe_roll:
-
             return {
                 "success": False,
                 "message": "Invalid roll number"
             }
-
-
-        # -------------------------------------------------
-        # Save photo
-        # -------------------------------------------------
 
         photo_filename = f"{safe_roll}.jpg"
 
@@ -287,64 +441,34 @@ async def register_student(
             photo_filename
         )
 
-        cv2.imwrite(
-            photo_path,
-            image
-        )
+        cv2.imwrite(photo_path, image)
 
-
-        # -------------------------------------------------
-        # Save student
-        # -------------------------------------------------
-
-        students = load_students()
-
-        students[safe_roll] = {
-
+        student = {
             "name": name,
-
-            "roll_number": roll_number,
-
+            "roll_number": safe_roll,
             "photo": photo_filename,
-
             "embedding": embedding
         }
 
-        save_students(students)
-
+        save_student(student)
 
         print(
-            f"✅ Student registered: "
-            f"{name} | {roll_number}"
+            f"✅ Student registered: {name} | {safe_roll}"
         )
 
-
         return {
-
             "success": True,
-
-            "message":
-                "Student registered successfully",
-
+            "message": "Student registered successfully",
             "name": name,
-
-            "roll_number": roll_number,
-
+            "roll_number": safe_roll,
             "photo": photo_filename
         }
 
-
     except Exception as e:
-
-        print(
-            "❌ Registration error:",
-            e
-        )
+        print("❌ Registration error:", e)
 
         return {
-
             "success": False,
-
             "message": str(e)
         }
 
@@ -357,13 +481,7 @@ async def register_student(
 async def upload_photo(
     file: UploadFile = File(...)
 ):
-
     try:
-
-        # -------------------------------------------------
-        # Read classroom image
-        # -------------------------------------------------
-
         image_bytes = await file.read()
 
         image_array = np.frombuffer(
@@ -377,55 +495,27 @@ async def upload_photo(
         )
 
         if image is None:
-
             return {
                 "success": False,
-                "message":
-                    "Invalid classroom image"
+                "message": "Invalid classroom image"
             }
-
-
-        # -------------------------------------------------
-        # Detect faces
-        # -------------------------------------------------
 
         height, width = image.shape[:2]
 
-        detector.setInputSize(
-            (width, height)
-        )
-
+        detector.setInputSize((width, height))
         _, faces = detector.detect(image)
 
-
         if faces is None:
-
             faces = []
-
 
         print()
         print("📷 Classroom photo received")
-        print(
-            f"👤 Faces detected: {len(faces)}"
-        )
-
-
-        # -------------------------------------------------
-        # Load students
-        # -------------------------------------------------
+        print(f"👤 Faces detected: {len(faces)}")
 
         students = load_students()
-
-
         recognized_students = []
 
-
-        # -------------------------------------------------
-        # Recognize faces
-        # -------------------------------------------------
-
         for face in faces:
-
             aligned_face = recognizer.alignCrop(
                 image,
                 face
@@ -435,23 +525,15 @@ async def upload_photo(
                 aligned_face
             )
 
-
             best_roll = None
             best_name = None
             best_score = -1
 
-
-            # -------------------------------------------------
-            # Compare with registered students
-            # -------------------------------------------------
-
             for roll, student in students.items():
-
                 stored_embedding = np.array(
                     student["embedding"],
                     dtype=np.float32
                 ).reshape(1, -1)
-
 
                 score = recognizer.match(
                     feature,
@@ -459,54 +541,27 @@ async def upload_photo(
                     cv2.FaceRecognizerSF_FR_COSINE
                 )
 
-
                 if score > best_score:
-
                     best_score = score
                     best_roll = roll
                     best_name = student["name"]
 
-
-            # -------------------------------------------------
-            # Recognition threshold
-            # -------------------------------------------------
-
             if best_score >= 0.30:
-
                 recognized_students.append({
-
                     "name": best_name,
-
                     "roll_number": best_roll,
-
-                    "confidence":
-                        round(
-                            float(best_score),
-                            4
-                        )
+                    "confidence": round(float(best_score), 4)
                 })
 
-
-        # =====================================================
+        # =================================================
         # MARK ATTENDANCE
-        # =====================================================
+        # =================================================
 
-        attendance = load_attendance()
-
-        # Always save attendance time in India Standard Time (IST).
         now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-        date = now.strftime(
-            "%Y-%m-%d"
-        )
+        date = now.strftime("%Y-%m-%d")
+        time = now.strftime("%H:%M:%S")
 
-        time = now.strftime(
-            "%H:%M:%S"
-        )
-
-        # Every /upload-photo operation creates a NEW attendance session.
-        # All students recognized from the same classroom photo share this
-        # session_id. A different classroom photo gets a different ID.
         session_id = (
             now.strftime("%Y%m%d_%H%M%S_%f")
             + "_"
@@ -514,13 +569,9 @@ async def upload_photo(
         )
 
         newly_marked = []
-
-        # Prevent the same detected student from being added twice to
-        # the SAME session if the detector happens to return duplicate faces.
         session_rolls = set()
 
         for student in recognized_students:
-
             roll_number = student["roll_number"]
 
             if roll_number in session_rolls:
@@ -528,88 +579,37 @@ async def upload_photo(
 
             session_rolls.add(roll_number)
 
-            # ---------------------------------------------
-            # Create a NEW attendance record for this session
-            # No same-day duplicate check is performed.
-            # ---------------------------------------------
-
             record = {
-
-                "session_id":
-                    session_id,
-
-                "name":
-                    student["name"],
-
-                "roll_number":
-                    roll_number,
-
-                "date":
-                    date,
-
-                "time":
-                    time,
-
-                "status":
-                    "Present",
-
-                "confidence":
-                    student["confidence"]
+                "session_id": session_id,
+                "name": student["name"],
+                "roll_number": roll_number,
+                "date": date,
+                "time": time,
+                "status": "Present",
+                "confidence": student["confidence"]
             }
 
-            attendance.append(record)
+            save_attendance_record(record)
             newly_marked.append(record)
 
-
-        # -------------------------------------------------
-        # Save attendance
-        # -------------------------------------------------
-
-        save_attendance(attendance)
-
-
         print(
-            f"✅ Attendance marked: "
-            f"{len(newly_marked)} student(s)"
+            f"✅ Attendance marked: {len(newly_marked)} student(s)"
         )
 
-
-        # =====================================================
-        # RESPONSE
-        # =====================================================
-
         return {
-
             "success": True,
-
-            "message":
-                "Attendance processed successfully",
-
-            "faces_detected":
-                len(faces),
-
-            "recognized_students":
-                recognized_students,
-
-            "attendance_marked":
-                newly_marked,
-
-            "session_id":
-                session_id
+            "message": "Attendance processed successfully",
+            "faces_detected": len(faces),
+            "recognized_students": recognized_students,
+            "attendance_marked": newly_marked,
+            "session_id": session_id
         }
 
-
     except Exception as e:
-
-        print(
-            "❌ Classroom processing error:",
-            e
-        )
+        print("❌ Classroom processing error:", e)
 
         return {
-
             "success": False,
-
             "message": str(e)
         }
 
@@ -620,80 +620,110 @@ async def upload_photo(
 
 @app.get("/attendance")
 def get_attendance():
-
     attendance = load_attendance()
 
     return {
-
         "success": True,
-
-        "attendance":
-            attendance
+        "attendance": attendance
     }
+
+
+# =====================================================
+# GET STUDENTS
+# =====================================================
+
 @app.get("/students")
 def get_students():
+    students_data = load_students()
 
     students = []
 
-    if os.path.exists(STUDENT_DB):
-
-        with open(STUDENT_DB, "r") as f:
-            data = json.load(f)
-
-        for roll_number, student in data.items():
-
-            students.append({
-                "name": student.get("name", "Unknown"),
-                "roll_number": roll_number
-            })
+    for roll_number, student in students_data.items():
+        students.append({
+            "name": student.get("name", "Unknown"),
+            "roll_number": roll_number
+        })
 
     return {
         "success": True,
         "students": students
     }
+
+
 # ============================================================
 # DELETE STUDENT
 # ============================================================
 
 @app.delete("/delete-student/{roll_number}")
 def delete_student(roll_number: str):
+    try:
+        if db_enabled():
+            with get_db() as conn:
+                row = conn.execute(
+                    """
+                    SELECT roll_number
+                    FROM students
+                    WHERE roll_number = %s
+                    """,
+                    (roll_number,)
+                ).fetchone()
 
-    if not os.path.exists(STUDENT_DB):
+                if not row:
+                    return {
+                        "success": False,
+                        "message": "Student not found"
+                    }
+
+                conn.execute(
+                    "DELETE FROM students WHERE roll_number = %s",
+                    (roll_number,)
+                )
+
+                conn.commit()
+
+        else:
+            if not os.path.exists(STUDENT_DB):
+                return {
+                    "success": False,
+                    "message": "No students registered"
+                }
+
+            with open(STUDENT_DB, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if roll_number not in data:
+                return {
+                    "success": False,
+                    "message": "Student not found"
+                }
+
+            del data[roll_number]
+
+            with open(STUDENT_DB, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+
+        safe_roll = "".join(
+            c for c in roll_number
+            if c.isalnum() or c in ("-", "_")
+        )
+
+        photo_path = os.path.join(
+            STUDENTS_FOLDER,
+            f"{safe_roll}.jpg"
+        )
+
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+
         return {
-            "success": False,
-            "message": "No students registered"
+            "success": True,
+            "message": "Student deleted successfully"
         }
 
-    with open(STUDENT_DB, "r") as f:
-        data = json.load(f)
+    except Exception as e:
+        print("❌ Delete student error:", e)
 
-    if roll_number not in data:
         return {
             "success": False,
-            "message": "Student not found"
+            "message": str(e)
         }
-
-    # Remove student from face-recognition database
-    del data[roll_number]
-
-    with open(STUDENT_DB, "w") as f:
-        json.dump(data, f, indent=4)
-
-    # Remove saved student photo
-    safe_roll = "".join(
-        c for c in roll_number
-        if c.isalnum() or c in ("-", "_")
-    )
-
-    photo_path = os.path.join(
-        STUDENTS_FOLDER,
-        f"{safe_roll}.jpg"
-    )
-
-    if os.path.exists(photo_path):
-        os.remove(photo_path)
-
-    return {
-        "success": True,
-        "message": "Student deleted successfully"
-    }
