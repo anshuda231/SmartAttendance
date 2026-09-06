@@ -72,8 +72,8 @@ SFACE_MODEL = os.path.join(
 # DATABASE CONFIGURATION
 # =====================================================
 
-# PostgreSQL is the permanent database on Render.
-# If DATABASE_URL is not available, JSON files are used as a local fallback.
+# Render PostgreSQL is the permanent database.
+# JSON is kept only as a local fallback.
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 STUDENT_DB = os.path.join(DATA_FOLDER, "students.json")
@@ -90,17 +90,44 @@ except Exception:
 def get_db_connection():
     if not DATABASE_URL or psycopg is None:
         return None
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-    return psycopg.connect(
-        DATABASE_URL,
-        row_factory=dict_row
-    )
+
+def load_students_json():
+    if not os.path.exists(STUDENT_DB):
+        return {}
+    try:
+        with open(STUDENT_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return {}
+
+
+def save_students_json(students):
+    with open(STUDENT_DB, "w", encoding="utf-8") as file:
+        json.dump(students, file, indent=4)
+
+
+def load_attendance_json():
+    if not os.path.exists(ATTENDANCE_DB):
+        return []
+    try:
+        with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return []
+
+
+def save_attendance_json(attendance):
+    with open(ATTENDANCE_DB, "w", encoding="utf-8") as file:
+        json.dump(attendance, file, indent=4)
 
 
 def init_database():
-    """Create PostgreSQL tables and migrate old JSON data once if needed."""
+    """Create PostgreSQL tables and migrate old JSON data once."""
     conn = get_db_connection()
     if conn is None:
+        print("⚠️ PostgreSQL not available; using JSON fallback")
         return
 
     try:
@@ -113,7 +140,6 @@ def init_database():
                     embedding JSONB NOT NULL
                 )
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS attendance (
                     id BIGSERIAL PRIMARY KEY,
@@ -126,15 +152,12 @@ def init_database():
                     confidence DOUBLE PRECISION
                 )
             """)
-
         conn.commit()
-
-        # One-time migration of old JSON data.
-        # Existing PostgreSQL rows are never overwritten.
-        migrate_json_to_postgres()
-
+        print("✅ PostgreSQL connected and tables ready")
     finally:
         conn.close()
+
+    migrate_json_to_postgres()
 
 
 def migrate_json_to_postgres():
@@ -152,8 +175,10 @@ def migrate_json_to_postgres():
                     with open(STUDENT_DB, "r", encoding="utf-8") as file:
                         old_students = json.load(file)
 
+                    migrated = 0
                     for roll, student in old_students.items():
-                        if not student.get("embedding"):
+                        embedding = student.get("embedding")
+                        if not embedding:
                             continue
 
                         cur.execute("""
@@ -165,10 +190,11 @@ def migrate_json_to_postgres():
                             roll,
                             student.get("name", "Unknown"),
                             student.get("photo"),
-                            json.dumps(student["embedding"])
+                            json.dumps(embedding)
                         ))
+                        migrated += 1
 
-                    print("✅ Old students JSON migrated to PostgreSQL")
+                    print(f"✅ Migrated {migrated} old student(s) to PostgreSQL")
                 except Exception as e:
                     print("⚠️ Student JSON migration skipped:", e)
 
@@ -180,6 +206,7 @@ def migrate_json_to_postgres():
                     with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
                         old_attendance = json.load(file)
 
+                    migrated = 0
                     for record in old_attendance:
                         cur.execute("""
                             INSERT INTO attendance
@@ -195,8 +222,9 @@ def migrate_json_to_postgres():
                             record.get("status", "Present"),
                             record.get("confidence")
                         ))
+                        migrated += 1
 
-                    print("✅ Old attendance JSON migrated to PostgreSQL")
+                    print(f"✅ Migrated {migrated} attendance record(s) to PostgreSQL")
                 except Exception as e:
                     print("⚠️ Attendance JSON migration skipped:", e)
 
@@ -205,49 +233,8 @@ def migrate_json_to_postgres():
         conn.close()
 
 
-# =====================================================
-# LOCAL JSON FALLBACK
-# =====================================================
-
-def load_students_json():
-    if not os.path.exists(STUDENT_DB):
-        return {}
-
-    try:
-        with open(STUDENT_DB, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception:
-        return {}
-
-
-def save_students_json(students):
-    with open(STUDENT_DB, "w", encoding="utf-8") as file:
-        json.dump(students, file, indent=4)
-
-
-def load_attendance_json():
-    if not os.path.exists(ATTENDANCE_DB):
-        return []
-
-    try:
-        with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception:
-        return []
-
-
-def save_attendance_json(attendance):
-    with open(ATTENDANCE_DB, "w", encoding="utf-8") as file:
-        json.dump(attendance, file, indent=4)
-
-
-# =====================================================
-# STUDENT DATABASE FUNCTIONS
-# =====================================================
-
 def load_students():
     conn = get_db_connection()
-
     if conn is None:
         return load_students_json()
 
@@ -260,16 +247,15 @@ def load_students():
             """)
             rows = cur.fetchall()
 
-        students = {}
-        for row in rows:
-            students[row["roll_number"]] = {
+        return {
+            row["roll_number"]: {
                 "name": row["name"],
                 "roll_number": row["roll_number"],
                 "photo": row["photo"],
                 "embedding": row["embedding"]
             }
-
-        return students
+            for row in rows
+        }
     finally:
         conn.close()
 
@@ -279,9 +265,9 @@ def save_student(student):
 
     if conn is None:
         students = load_students_json()
-        roll = student["roll_number"]
-        students[roll] = student
+        students[student["roll_number"]] = student
         save_students_json(students)
+        print("⚠️ Student saved to JSON fallback:", student["roll_number"])
         return
 
     try:
@@ -301,19 +287,14 @@ def save_student(student):
                 student.get("photo"),
                 json.dumps(student["embedding"])
             ))
-
         conn.commit()
+        print("✅ Student saved to PostgreSQL:", student["roll_number"])
     finally:
         conn.close()
 
 
-# =====================================================
-# ATTENDANCE DATABASE FUNCTIONS
-# =====================================================
-
 def load_attendance():
     conn = get_db_connection()
-
     if conn is None:
         return load_attendance_json()
 
@@ -340,6 +321,7 @@ def save_attendance_records(records):
         attendance = load_attendance_json()
         attendance.extend(records)
         save_attendance_json(attendance)
+        print("⚠️ Attendance saved to JSON fallback")
         return
 
     try:
@@ -359,14 +341,10 @@ def save_attendance_records(records):
                     record["status"],
                     record["confidence"]
                 ))
-
         conn.commit()
+        print(f"✅ Saved {len(records)} attendance record(s) to PostgreSQL")
     finally:
         conn.close()
-
-
-# Initialize PostgreSQL at startup.
-init_database()
 
 # =====================================================
 # LOAD MODELS
@@ -391,83 +369,8 @@ recognizer = cv2.FaceRecognizerSF.create(
 
 print("✅ SFace face recognizer loaded")
 
-
-# =====================================================
-# STUDENT DATABASE FUNCTIONS
-# =====================================================
-
-def load_students():
-
-    if not os.path.exists(STUDENT_DB):
-        return {}
-
-    try:
-
-        with open(
-            STUDENT_DB,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return json.load(file)
-
-    except:
-
-        return {}
-
-
-def save_students(students):
-
-    with open(
-        STUDENT_DB,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            students,
-            file,
-            indent=4
-        )
-
-
-# =====================================================
-# ATTENDANCE DATABASE FUNCTIONS
-# =====================================================
-
-def load_attendance():
-
-    if not os.path.exists(ATTENDANCE_DB):
-        return []
-
-    try:
-
-        with open(
-            ATTENDANCE_DB,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return json.load(file)
-
-    except:
-
-        return []
-
-
-def save_attendance(attendance):
-
-    with open(
-        ATTENDANCE_DB,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            attendance,
-            file,
-            indent=4
-        )
+# Initialize permanent PostgreSQL storage.
+init_database()
 
 
 # =====================================================
@@ -957,6 +860,7 @@ def delete_student(roll_number: str):
 
         del data[roll_number]
         save_students_json(data)
+
     else:
         try:
             with conn.cursor() as cur:
@@ -972,11 +876,12 @@ def delete_student(roll_number: str):
                     }
 
             conn.commit()
+            print("✅ Student deleted from PostgreSQL:", roll_number)
         finally:
             conn.close()
 
-    # Remove saved student photo from the local instance.
-    # Attendance records are intentionally preserved.
+    # Delete the local photo when it exists.
+    # Attendance records remain preserved.
     safe_roll = "".join(
         c for c in roll_number
         if c.isalnum() or c in ("-", "_")
