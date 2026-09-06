@@ -69,19 +69,304 @@ SFACE_MODEL = os.path.join(
 
 
 # =====================================================
-# DATABASE FILES
+# DATABASE CONFIGURATION
 # =====================================================
 
-STUDENT_DB = os.path.join(
-    DATA_FOLDER,
-    "students.json"
-)
+# PostgreSQL is the permanent database on Render.
+# If DATABASE_URL is not available, JSON files are used as a local fallback.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-ATTENDANCE_DB = os.path.join(
-    DATA_FOLDER,
-    "attendance.json"
-)
+STUDENT_DB = os.path.join(DATA_FOLDER, "students.json")
+ATTENDANCE_DB = os.path.join(DATA_FOLDER, "attendance.json")
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:
+    psycopg = None
+    dict_row = None
+
+
+def get_db_connection():
+    if not DATABASE_URL or psycopg is None:
+        return None
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
+    )
+
+
+def init_database():
+    """Create PostgreSQL tables and migrate old JSON data once if needed."""
+    conn = get_db_connection()
+    if conn is None:
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS students (
+                    roll_number TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    photo TEXT,
+                    embedding JSONB NOT NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    roll_number TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    confidence DOUBLE PRECISION
+                )
+            """)
+
+        conn.commit()
+
+        # One-time migration of old JSON data.
+        # Existing PostgreSQL rows are never overwritten.
+        migrate_json_to_postgres()
+
+    finally:
+        conn.close()
+
+
+def migrate_json_to_postgres():
+    conn = get_db_connection()
+    if conn is None:
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS count FROM students")
+            student_count = cur.fetchone()["count"]
+
+            if student_count == 0 and os.path.exists(STUDENT_DB):
+                try:
+                    with open(STUDENT_DB, "r", encoding="utf-8") as file:
+                        old_students = json.load(file)
+
+                    for roll, student in old_students.items():
+                        if not student.get("embedding"):
+                            continue
+
+                        cur.execute("""
+                            INSERT INTO students
+                                (roll_number, name, photo, embedding)
+                            VALUES (%s, %s, %s, %s::jsonb)
+                            ON CONFLICT (roll_number) DO NOTHING
+                        """, (
+                            roll,
+                            student.get("name", "Unknown"),
+                            student.get("photo"),
+                            json.dumps(student["embedding"])
+                        ))
+
+                    print("✅ Old students JSON migrated to PostgreSQL")
+                except Exception as e:
+                    print("⚠️ Student JSON migration skipped:", e)
+
+            cur.execute("SELECT COUNT(*) AS count FROM attendance")
+            attendance_count = cur.fetchone()["count"]
+
+            if attendance_count == 0 and os.path.exists(ATTENDANCE_DB):
+                try:
+                    with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
+                        old_attendance = json.load(file)
+
+                    for record in old_attendance:
+                        cur.execute("""
+                            INSERT INTO attendance
+                                (session_id, name, roll_number, date, time,
+                                 status, confidence)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            record.get("session_id", ""),
+                            record.get("name", "Unknown"),
+                            record.get("roll_number", ""),
+                            record.get("date", ""),
+                            record.get("time", ""),
+                            record.get("status", "Present"),
+                            record.get("confidence")
+                        ))
+
+                    print("✅ Old attendance JSON migrated to PostgreSQL")
+                except Exception as e:
+                    print("⚠️ Attendance JSON migration skipped:", e)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# =====================================================
+# LOCAL JSON FALLBACK
+# =====================================================
+
+def load_students_json():
+    if not os.path.exists(STUDENT_DB):
+        return {}
+
+    try:
+        with open(STUDENT_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return {}
+
+
+def save_students_json(students):
+    with open(STUDENT_DB, "w", encoding="utf-8") as file:
+        json.dump(students, file, indent=4)
+
+
+def load_attendance_json():
+    if not os.path.exists(ATTENDANCE_DB):
+        return []
+
+    try:
+        with open(ATTENDANCE_DB, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return []
+
+
+def save_attendance_json(attendance):
+    with open(ATTENDANCE_DB, "w", encoding="utf-8") as file:
+        json.dump(attendance, file, indent=4)
+
+
+# =====================================================
+# STUDENT DATABASE FUNCTIONS
+# =====================================================
+
+def load_students():
+    conn = get_db_connection()
+
+    if conn is None:
+        return load_students_json()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roll_number, name, photo, embedding
+                FROM students
+                ORDER BY roll_number
+            """)
+            rows = cur.fetchall()
+
+        students = {}
+        for row in rows:
+            students[row["roll_number"]] = {
+                "name": row["name"],
+                "roll_number": row["roll_number"],
+                "photo": row["photo"],
+                "embedding": row["embedding"]
+            }
+
+        return students
+    finally:
+        conn.close()
+
+
+def save_student(student):
+    conn = get_db_connection()
+
+    if conn is None:
+        students = load_students_json()
+        roll = student["roll_number"]
+        students[roll] = student
+        save_students_json(students)
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO students
+                    (roll_number, name, photo, embedding)
+                VALUES (%s, %s, %s, %s::jsonb)
+                ON CONFLICT (roll_number)
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    photo = EXCLUDED.photo,
+                    embedding = EXCLUDED.embedding
+            """, (
+                student["roll_number"],
+                student["name"],
+                student.get("photo"),
+                json.dumps(student["embedding"])
+            ))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# =====================================================
+# ATTENDANCE DATABASE FUNCTIONS
+# =====================================================
+
+def load_attendance():
+    conn = get_db_connection()
+
+    if conn is None:
+        return load_attendance_json()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT session_id, name, roll_number, date, time,
+                       status, confidence
+                FROM attendance
+                ORDER BY id ASC
+            """)
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def save_attendance_records(records):
+    if not records:
+        return
+
+    conn = get_db_connection()
+
+    if conn is None:
+        attendance = load_attendance_json()
+        attendance.extend(records)
+        save_attendance_json(attendance)
+        return
+
+    try:
+        with conn.cursor() as cur:
+            for record in records:
+                cur.execute("""
+                    INSERT INTO attendance
+                        (session_id, name, roll_number, date, time,
+                         status, confidence)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    record["session_id"],
+                    record["name"],
+                    record["roll_number"],
+                    record["date"],
+                    record["time"],
+                    record["status"],
+                    record["confidence"]
+                ))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Initialize PostgreSQL at startup.
+init_database()
 
 # =====================================================
 # LOAD MODELS
@@ -319,20 +604,14 @@ async def register_student(
         # Save student
         # -------------------------------------------------
 
-        students = load_students()
-
-        students[safe_roll] = {
-
+        student_record = {
             "name": name,
-
             "roll_number": roll_number,
-
             "photo": photo_filename,
-
             "embedding": embedding
         }
 
-        save_students(students)
+        save_student(student_record)
 
 
         print(
@@ -504,8 +783,6 @@ async def upload_photo(
         # MARK ATTENDANCE
         # =====================================================
 
-        attendance = load_attendance()
-
         # Always save attendance time in India Standard Time (IST).
         now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
@@ -578,7 +855,7 @@ async def upload_photo(
         # Save attendance
         # -------------------------------------------------
 
-        save_attendance(attendance)
+        save_attendance_records(newly_marked)
 
 
         print(
@@ -646,19 +923,15 @@ def get_attendance():
 @app.get("/students")
 def get_students():
 
+    data = load_students()
+
     students = []
 
-    if os.path.exists(STUDENT_DB):
-
-        with open(STUDENT_DB, "r") as f:
-            data = json.load(f)
-
-        for roll_number, student in data.items():
-
-            students.append({
-                "name": student.get("name", "Unknown"),
-                "roll_number": roll_number
-            })
+    for roll_number, student in data.items():
+        students.append({
+            "name": student.get("name", "Unknown"),
+            "roll_number": roll_number
+        })
 
     return {
         "success": True,
@@ -671,28 +944,39 @@ def get_students():
 @app.delete("/delete-student/{roll_number}")
 def delete_student(roll_number: str):
 
-    if not os.path.exists(STUDENT_DB):
-        return {
-            "success": False,
-            "message": "No students registered"
-        }
+    conn = get_db_connection()
 
-    with open(STUDENT_DB, "r") as f:
-        data = json.load(f)
+    if conn is None:
+        data = load_students_json()
 
-    if roll_number not in data:
-        return {
-            "success": False,
-            "message": "Student not found"
-        }
+        if roll_number not in data:
+            return {
+                "success": False,
+                "message": "Student not found"
+            }
 
-    # Remove student from face-recognition database
-    del data[roll_number]
+        del data[roll_number]
+        save_students_json(data)
+    else:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM students WHERE roll_number = %s",
+                    (roll_number,)
+                )
 
-    with open(STUDENT_DB, "w") as f:
-        json.dump(data, f, indent=4)
+                if cur.rowcount == 0:
+                    return {
+                        "success": False,
+                        "message": "Student not found"
+                    }
 
-    # Remove saved student photo
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Remove saved student photo from the local instance.
+    # Attendance records are intentionally preserved.
     safe_roll = "".join(
         c for c in roll_number
         if c.isalnum() or c in ("-", "_")
@@ -704,9 +988,13 @@ def delete_student(roll_number: str):
     )
 
     if os.path.exists(photo_path):
-        os.remove(photo_path)
+        try:
+            os.remove(photo_path)
+        except Exception as e:
+            print("⚠️ Could not remove photo:", e)
 
     return {
         "success": True,
         "message": "Student deleted successfully"
     }
+
