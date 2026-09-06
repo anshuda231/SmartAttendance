@@ -382,7 +382,8 @@ def home():
 
     return {
         "success": True,
-        "message": "Smart Attendance Backend is Running"
+        "message": "Smart Attendance Backend is Running",
+        "database": "PostgreSQL" if get_db_connection() is not None else "Local JSON"
     }
 
 
@@ -750,7 +751,6 @@ async def upload_photo(
                     student["confidence"]
             }
 
-            attendance.append(record)
             newly_marked.append(record)
 
 
