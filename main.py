@@ -525,9 +525,23 @@ async def upload_photo(
                 aligned_face
             )
 
-            best_roll = None
-            best_name = None
-            best_score = -1
+            # =================================================
+            # STRICT FACE RECOGNITION
+            # =================================================
+            # SFace cosine similarity:
+            # Higher score = more similar.
+            #
+            # 0.30 was too permissive and could create false
+            # positives. We now require:
+            #   1) a strong absolute similarity score
+            #   2) a clear margin over the second-best student
+            #
+            # A face that does not satisfy BOTH conditions is
+            # treated as unknown and is NOT marked Present.
+            RECOGNITION_THRESHOLD = 0.40
+            MIN_MATCH_MARGIN = 0.05
+
+            matches = []
 
             for roll, student in students.items():
                 stored_embedding = np.array(
@@ -535,23 +549,61 @@ async def upload_photo(
                     dtype=np.float32
                 ).reshape(1, -1)
 
-                score = recognizer.match(
+                score = float(recognizer.match(
                     feature,
                     stored_embedding,
                     cv2.FaceRecognizerSF_FR_COSINE
+                ))
+
+                matches.append({
+                    "roll_number": roll,
+                    "name": student["name"],
+                    "score": score
+                })
+
+            if matches:
+                matches.sort(key=lambda x: x["score"], reverse=True)
+
+                best_match = matches[0]
+                best_score = best_match["score"]
+
+                second_score = (
+                    matches[1]["score"]
+                    if len(matches) > 1
+                    else -1.0
                 )
 
-                if score > best_score:
-                    best_score = score
-                    best_roll = roll
-                    best_name = student["name"]
+                margin = best_score - second_score
 
-            if best_score >= 0.30:
-                recognized_students.append({
-                    "name": best_name,
-                    "roll_number": best_roll,
-                    "confidence": round(float(best_score), 4)
-                })
+                print(
+                    f"🔎 Best match: {best_match['name']} "
+                    f"({best_score:.4f}), "
+                    f"second: {second_score:.4f}, "
+                    f"margin: {margin:.4f}"
+                )
+
+                # IMPORTANT:
+                # Do NOT mark attendance unless the face is both
+                # similar enough AND clearly better than the next
+                # candidate.
+                if (
+                    best_score >= RECOGNITION_THRESHOLD
+                    and (
+                        len(matches) == 1
+                        or margin >= MIN_MATCH_MARGIN
+                    )
+                ):
+                    recognized_students.append({
+                        "name": best_match["name"],
+                        "roll_number": best_match["roll_number"],
+                        "confidence": round(best_score, 4)
+                    })
+                else:
+                    print(
+                        f"⚠️ Unknown face rejected: "
+                        f"best_score={best_score:.4f}, "
+                        f"margin={margin:.4f}"
+                    )
 
         # =================================================
         # MARK ATTENDANCE
